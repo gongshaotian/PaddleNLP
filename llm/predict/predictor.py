@@ -184,6 +184,10 @@ class PredictorArgument:
         default="",
         metadata={"help": "Quantization type of moe. Supported values: weight_only_int4, weight_only_int8"},
     )
+    output_via_mq: bool = field(
+        default=True,
+        metadata={"help": "Controls whether the message queue is enabled for output"},
+    )
 
     def __post_init__(self):
         if self.speculate_method is not None:
@@ -1075,6 +1079,7 @@ class DygraphBlockInferencePredictor(BlockInferencePredictorMixin):
     ):
         self.return_full_hidden_states = config.return_full_hidden_states
         self.full_hidden_states = None
+        self.tokenizer = tokenizer
         if model is None:
             raise ValueError("model should be provided for DygraphBlockInferencePredictor")
         self.cache_k_shapes, self.cache_v_shapes = model.get_cache_kvs_shape(model.config, config.batch_size)
@@ -1126,7 +1131,7 @@ class DygraphBlockInferencePredictor(BlockInferencePredictorMixin):
         )
 
     @paddle.no_grad()
-    def predict(self, input_texts: list[str], return_tokens=False):
+    def predict_via_mq(self, input_texts: list[str], return_tokens=False):
         self._preprocess(input_texts)
         if self.proposer is not None:
             self.proposer.insert_query(
@@ -1186,6 +1191,51 @@ class DygraphBlockInferencePredictor(BlockInferencePredictorMixin):
             else:
                 return outputs
 
+    @paddle.no_grad()
+    def predict(self, input_texts: list[str], return_tokens=False):
+        if self.config.output_via_mq:
+            return self.predict_via_mq(input_texts, return_tokens)
+        self._preprocess(input_texts)
+
+        if self.proposer is not None:
+            self.proposer.insert_query(
+                base_model_inputs=self.model_inputs, real_bs=len(input_texts), seq_lens=self.seq_lens
+            )
+
+        output_tokens = []
+        output_token = []
+        s_time = time.time()
+        while self.model_inputs["not_need_stop"]:
+            # whether speculative decoding
+            if self.proposer is not None:
+                self.proposer.run(
+                    self.model_inputs,
+                    real_batch_size=self.batch_size,
+                    seq_lens_this_time=self.model_inputs["seq_lens_this_time"],
+                    base_model_full_hidden_states=self.full_hidden_states,
+                )
+            if self.return_full_hidden_states:
+                self.full_hidden_states = self._infer(self.model_inputs)
+            else:
+                outputs = self._infer(self.model_inputs)
+                outputs = outputs.numpy()
+                outputs[outputs == -1] = self.tokenizer.eos_token_id
+                output_token.append(outputs)
+        logger.info(f"running spend {time.time() - s_time}")
+
+        if self.tensor_parallel_rank == 0:
+            outputs = []
+            while len(outputs) < len(input_texts):
+                output_tokens = np.concatenate(output_token, axis=1).tolist()
+                outputs = self.tokenizer.batch_decode(
+                    output_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                )
+
+            if return_tokens:
+                return outputs, output_tokens
+            else:
+                return outputs
+
 
 class StaticGraphBlockInferencePredictor(BlockInferencePredictorMixin):
     def __init__(
@@ -1199,6 +1249,7 @@ class StaticGraphBlockInferencePredictor(BlockInferencePredictorMixin):
         self.cache_v_shapes = kwargs.get("cache_v_shapes", None)
         self.model_args = kwargs.get("model_args", None)
         self.return_full_hidden_states = config.return_full_hidden_states
+        self.tokenizer = tokenizer
         self.full_hidden_states = None
         if self.cache_k_shapes is None:
             raise ValueError(
@@ -1291,7 +1342,7 @@ class StaticGraphBlockInferencePredictor(BlockInferencePredictorMixin):
 
         self.predictor = paddle.inference.create_predictor(config)
 
-    def predict(self, input_texts: list[str], return_tokens=False):
+    def predict_via_mq(self, input_texts: list[str], return_tokens=False):
         s_time = time.time()
         self._preprocess(input_texts)
         if self.proposer is not None:
@@ -1349,6 +1400,52 @@ class StaticGraphBlockInferencePredictor(BlockInferencePredictorMixin):
 
             read_res_process.terminate()
 
+            if return_tokens:
+                return outputs, output_tokens
+            else:
+                return outputs
+
+    def predict(self, input_texts: list[str], return_tokens=False):
+        if self.config.output_via_mq:
+            return self.predict_via_mq(input_texts, return_tokens)
+
+        s_time = time.time()
+        self._preprocess(input_texts)
+        if self.proposer is not None:
+            self.proposer.insert_query(
+                base_model_inputs=self.model_inputs, real_bs=len(input_texts), seq_lens=self.seq_lens
+            )
+        logger.info(f"preprocess spend {time.time() - s_time}")
+
+        output_tokens = []
+        output_token = []
+        s_time = time.time()
+        while self.model_inputs["not_need_stop"]:
+            # whether speculative decoding
+            if self.proposer is not None:
+                self.proposer.run(
+                    self.model_inputs,
+                    real_batch_size=self.batch_size,
+                    seq_lens_this_time=self.model_inputs["seq_lens_this_time"],
+                    base_model_full_hidden_states=self.full_hidden_states,
+                )
+            if self.return_full_hidden_states:
+                self.full_hidden_states = self.predictor.run(list(self.model_inputs.values()))[0]
+            else:
+                outputs = self.predictor.run(list(self.model_inputs.values()))[0]
+                outputs = outputs.numpy()
+                outputs[outputs == -1] = self.tokenizer.eos_token_id
+                output_token.append(outputs)
+        logger.info(f"running spend {time.time() - s_time}")
+
+        if self.tensor_parallel_rank == 0:
+            outputs = []
+            output_tokens = []
+            while len(outputs) < self.batch_size:
+                output_tokens = np.concatenate(output_token, axis=1).tolist()
+                outputs = self.tokenizer.batch_decode(
+                    output_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                )
             if return_tokens:
                 return outputs, output_tokens
             else:
