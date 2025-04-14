@@ -35,11 +35,9 @@ class PostProcess(nn.Layer):
         super().__init__()
         
     def forward(self,             
-        encoder_outputs,
-        tensor_parallel_rank,  # self.config
-        tensor_parallel_degree, # self.config
-
-        **kwargs,):
+            encoder_outputs : paddle.Tensor,
+            **kwargs
+        ):
         """Explicitly passing tensor type input"""
         step_idx = kwargs["step_idx"]
         logits = paddle.cast(encoder_outputs, paddle.float32)
@@ -75,7 +73,7 @@ class PostProcess(nn.Layer):
         else:
             _, next_tokens = paddle.tensor.top_p_sampling(probs, kwargs["top_p"])
 
-        if tensor_parallel_degree > 1:
+        if kwargs["tensor_parallel_degree"] > 1:
             paddle.distributed.broadcast(next_tokens, 0)
 
         with paddle.base.framework._stride_in_no_check_dy2st_diff():
@@ -101,8 +99,8 @@ class PostProcess(nn.Layer):
 
         f_save_output(
             next_tokens,
-            model_kwargs["not_need_stop"],
-            tensor_parallel_rank,
+            kwargs["not_need_stop"],
+            kwargs["tensor_parallel_rank"],
         )
         return next_tokens
 
@@ -122,12 +120,24 @@ class CudaGraphRunner(nn.Layer):
     def graph(self):
         assert self._graph is not None
         return self._graph
+
+    def prepare_input_buffer(self, **kwargs):
+        """ """
+        for (name, value) in kwargs.items():
+            if type(value) == paddle.Tensor:
+                if (self.input_buffers[name] == None):
+                    self.input_buffers[name] = paddle.zeros_like(value)
+                self.input_buffers[name].copy_(value, True)
+            else:
+                self.input_buffers[name] = value
     
     def capture(self, input_ids, **kwargs):
         assert self._graph is None
         # prepare input buffer 
         self.input_buffers["input_ids"] = paddle.zeros_like(input_ids)
         self.input_buffers["input_ids"].copy_(input_ids, True)
+        self.prepare_input_buffer(**kwargs)
+
         paddle.device.cuda.synchronize()  # 8 卡都要同步
         for _ in self._NUM_WARMUP_ITERS:
             self.model(input_ids = self.input_buffers["input_ids"], **kwargs)
@@ -142,14 +152,14 @@ class CudaGraphRunner(nn.Layer):
         model_out_put._clear()
         
         paddle.device.cuda.synchronize()
-        # process input and output buffer
-        self.input_buffers.update(kwargs)
+        # process output buffer
         self.output_buffers["output_ids"] = intermediate_output
 
     def forward(self, input_ids, **kwargs) -> paddle.Tensor:
         # copy input_tensors to input_buffers
         self.input_buffers["input_ids"].copy_(input_ids, True)
-        
+        self.prepare_input_buffer(**kwargs)
+
         self._grpah.replay()
 
         return self.output_buffers["output_ids"]
@@ -533,6 +543,10 @@ class GenerationInferenceModel(GenerationMixin):
         )
 
 class GenerationBlockInferenceModel(GenerationMixin):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        pass
+
     @classmethod
     def get_cache_kvs_shape(cls, max_batch_size: int = None, max_length: int = None) -> list[list[int]]:
         raise NotImplementedError
@@ -832,6 +846,7 @@ class GenerationBlockInferenceModel(GenerationMixin):
             print(type(outputs), type(top_k), type(top_p), type(penalty_score), type(frequency_score), type(presence_score), type(temperature))
             for (key, value) in model_kwargs.items():
                 print(key, type(value))
+            print(type(self.config.tensor_parallel_degree), type(self.config.tensor_parallel_rank))
             # origin code
             step_idx = model_kwargs["step_idx"]
             logits = paddle.cast(outputs, paddle.float32)
@@ -901,16 +916,26 @@ class GenerationBlockInferenceModel(GenerationMixin):
         # encoder
         outputs = _forward_(**model_kwargs)  # [bs, 1, dim_embed]
         # first decoder
-        next_tokens = _post_process_(
-            outputs,
-            top_k,
-            top_p,
-            penalty_score,
-            frequency_score,
-            presence_score,
-            temperature,
-            model_kwargs,
-        )
+        next_tokens = self.cuda_graph_runner(outputs, 
+            top_k=top_k,
+            top_p=top_p,
+            penalty_score=penalty_score,
+            frequency_score=penalty_score,
+            presence_score=penalty_score,
+            temperature=penalty_score,
+            tensor_parallel_degree=self.config.tensor_parallel_degree,
+            tensor_parallel_rank=self.config.tensor_parallel_rank,
+            **model_kwargs)
+        # next_tokens = _post_process_(
+        #     outputs,
+        #     top_k,
+        #     top_p,
+        #     penalty_score,
+        #     frequency_score,
+        #     presence_score,
+        #     temperature,
+        #     model_kwargs,
+        # )
 
         return next_tokens
 
