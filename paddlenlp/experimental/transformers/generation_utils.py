@@ -130,7 +130,7 @@ class CudaGraphRunner(nn.Layer):
             if type(value) == paddle.Tensor:
                 if (name not in self.input_buffers.keys()):
                     self.input_buffers[name] = paddle.zeros_like(value)
-                self.input_buffers[name].copy_(value, True)
+                self.input_buffers[name].copy_(value, False)
             else:
                 self.input_buffers[name] = value
             # print(f"parameter name: {name}, value: {value}, buffer value: {self.input_buffers[name]}")
@@ -139,7 +139,7 @@ class CudaGraphRunner(nn.Layer):
         assert self._graph is None
         # prepare input buffer 
         self.input_buffers["graph_inputs"] = paddle.zeros_like(graph_inputs)
-        self.input_buffers["graph_inputs"].copy_(graph_inputs, True)
+        self.input_buffers["graph_inputs"].copy_(graph_inputs, False)
         self.prepare_input_buffer(**kwargs)
 
         paddle.device.synchronize()  # 8 卡都要同步
@@ -164,7 +164,7 @@ class CudaGraphRunner(nn.Layer):
     def forward(self, graph_inputs, **kwargs) -> paddle.Tensor:
         print("---------------------- start cuda graph runner replay ----------------------")
         # copy input_tensors to input_buffers
-        self.input_buffers["graph_inputs"].copy_(graph_inputs, True)
+        self.input_buffers["graph_inputs"].copy_(graph_inputs, False)
         self.prepare_input_buffer(**kwargs)
 
         self._graph.replay()
@@ -929,9 +929,9 @@ class GenerationBlockInferenceModel(GenerationMixin):
                 top_k=top_k,
                 top_p=top_p,
                 penalty_score=penalty_score,
-                frequency_score=penalty_score,
-                presence_score=penalty_score,
-                temperature=penalty_score,
+                frequency_score=frequency_score,
+                presence_score=presence_score,
+                temperature=temperature,
                 tensor_parallel_degree=self.config.tensor_parallel_degree,
                 tensor_parallel_rank=self.config.tensor_parallel_rank,
                 eos_token_id=eos_token_id,
@@ -941,9 +941,9 @@ class GenerationBlockInferenceModel(GenerationMixin):
             top_k=top_k,
             top_p=top_p,
             penalty_score=penalty_score,
-            frequency_score=penalty_score,
-            presence_score=penalty_score,
-            temperature=penalty_score,
+            frequency_score=frequency_score,
+            presence_score=presence_score,
+            temperature=temperature,
             tensor_parallel_degree=self.config.tensor_parallel_degree,
             tensor_parallel_rank=self.config.tensor_parallel_rank,
             eos_token_id=eos_token_id,
