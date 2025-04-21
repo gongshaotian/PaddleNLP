@@ -18,6 +18,7 @@ from typing import List, Union
 
 import paddle
 import paddle.nn.functional as F
+from paddle import nn
 
 from paddlenlp.generation import GenerationMixin, LogitsProcessor, LogitsProcessorList
 
@@ -27,6 +28,148 @@ __all__ = ["GenerationInferenceModel", "GenerationBlockInferenceModel", "Generat
 def use_faster_top_p_sampling():
     """Get the value of the 'USE_FASTER_TOP_P_SAMPLING' environment variable."""
     return os.getenv("USE_FASTER_TOP_P_SAMPLING", "False") in ["True", "1", "true"]
+
+
+class PostProcessLayer(nn.Layer):
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self,             
+            encoder_outputs : paddle.Tensor,
+            **kwargs
+        ):
+        """Explicitly passing tensor type input"""
+        step_idx = kwargs["step_idx"]
+        logits = paddle.cast(encoder_outputs, paddle.float32)
+
+        from paddlenlp_ops import f_set_preids_token_penalty_multi_scores
+
+        f_set_preids_token_penalty_multi_scores(
+            kwargs["pre_ids"],
+            kwargs["input_ids"],
+            kwargs["seq_lens_encoder"],
+            kwargs["seq_lens_decoder"],
+            step_idx,
+            kwargs["stop_flags"],
+            logits,
+            kwargs["penalty_score"],
+            kwargs["frequency_score"],
+            kwargs["presence_score"],
+            kwargs["temperature"],
+            kwargs["bad_tokens"],
+            step_idx,
+            kwargs["min_dec_len"],
+            kwargs["eos_token_id"],
+        )
+
+        # sample
+        probs = F.softmax(logits)
+
+        # compute next_tokens
+        if use_faster_top_p_sampling():
+            from paddlenlp_ops import top_p_sampling_reject
+
+            next_tokens = top_p_sampling_reject(probs, kwargs["top_p"], 0)
+        else:
+            _, next_tokens = paddle.tensor.top_p_sampling(probs, kwargs["top_p"])
+
+        if kwargs["tensor_parallel_degree"] > 1:
+            paddle.distributed.broadcast(next_tokens, 0)
+
+        with paddle.base.framework._stride_in_no_check_dy2st_diff():
+            from paddlenlp_ops import f_update_inputs_v2
+
+            f_update_inputs_v2(
+                kwargs["stop_flags"],
+                kwargs["step_idx"],
+                kwargs["not_need_stop"],
+                kwargs["seq_lens_this_time"],
+                kwargs["seq_lens_encoder"],
+                kwargs["seq_lens_decoder"],
+                kwargs["max_dec_len"],
+                kwargs["input_ids"],
+                kwargs["stop_nums"],
+                next_tokens,
+                kwargs["is_block_step"],
+                kwargs["eos_token_id"],
+                kwargs["next_tokens"],
+            )
+
+        from paddlenlp_ops import f_save_output
+
+        f_save_output(
+            next_tokens,
+            kwargs["not_need_stop"],
+            kwargs["tensor_parallel_rank"],
+        )
+        return next_tokens
+
+
+class CudaGraphRunner(nn.Layer):
+    def __init__(self, model: nn.Layer):
+        super().__init__()
+        self.model = model
+        
+        self.input_buffers: Dict[str, paddle.Tensor] = {}
+        self.output_buffers: Dict[str, paddle.Tensor] = {}
+
+        self._graph:Optional[paddle.device.cuda.graphs.CUDAGraph] = None
+        
+        self._NUM_WARMUP_ITERS = 10
+
+    def graph(self):
+        assert self._graph is not None
+        return self._graph
+    
+    def graph_is_none(self):
+        return self._graph is None
+
+    def prepare_input_buffer(self, **kwargs) -> None:
+        """ """
+        for (name, value) in kwargs.items():
+            if type(value) == paddle.Tensor:
+                if (name not in self.input_buffers.keys()):
+                    self.input_buffers[name] = paddle.zeros_like(value)
+                self.input_buffers[name].copy_(value, False)
+            else:
+                self.input_buffers[name] = value
+            # print(f"parameter name: {name}, value: {value}, buffer value: {self.input_buffers[name]}")
+    
+    def capture(self, graph_inputs, **kwargs) -> None:
+        assert self._graph is None
+        # prepare input buffer 
+        self.input_buffers["graph_inputs"] = paddle.zeros_like(graph_inputs)
+        self.input_buffers["graph_inputs"].copy_(graph_inputs, False)
+        self.prepare_input_buffer(**kwargs)
+
+        paddle.device.synchronize()  # 8 卡都要同步
+        for _ in range(self._NUM_WARMUP_ITERS):
+            self.model(encoder_outputs = self.input_buffers["graph_inputs"], **kwargs)
+
+        self._graph = paddle.device.cuda.graphs.CUDAGraph()
+        self._graph.capture_begin()
+        model_out_put = self.model(encoder_outputs = self.input_buffers["graph_inputs"], **kwargs)
+        self._graph.capture_end()
+
+        intermediate_output = paddle.zeros_like(model_out_put)
+        model_out_put._share_buffer_to(intermediate_output)
+        model_out_put._clear()
+        
+        paddle.device.synchronize()
+        # process output buffer
+        self.output_buffers["output_ids"] = intermediate_output
+
+        self._graph.print_to_dot_files("/root/paddlejob/workspace/env_run/output/gongshaotian/Log/cudaGraph/test_r1", 1 << 0)
+
+    def forward(self, graph_inputs, **kwargs) -> paddle.Tensor:
+        print("---------------------- start cuda graph runner replay ----------------------")
+        # copy input_tensors to input_buffers
+        self.input_buffers["graph_inputs"].copy_(graph_inputs, False)
+        self.prepare_input_buffer(**kwargs)
+
+        self._graph.replay()
+
+        return self.output_buffers["output_ids"]
 
 
 class ForcedDecodingEOSTokenLogitsProcessor(LogitsProcessor):
@@ -47,7 +190,6 @@ class ForcedDecodingEOSTokenLogitsProcessor(LogitsProcessor):
             scores[:] = paddle.finfo(scores.dtype).min
             scores[:, self.forced_eos_token_id] = 0
         return scores
-
 
 class GenerationInferenceModel(GenerationMixin):
     @classmethod
@@ -406,8 +548,12 @@ class GenerationInferenceModel(GenerationMixin):
             model_kwargs["tgt_pos"],
         )
 
-
 class GenerationBlockInferenceModel(GenerationMixin):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _post_process_layer = PostProcessLayer()
+        self.cuda_graph_runner =  CudaGraphRunner(_post_process_layer)
+
     @classmethod
     def get_cache_kvs_shape(cls, max_batch_size: int = None, max_length: int = None) -> list[list[int]]:
         raise NotImplementedError
@@ -703,6 +849,12 @@ class GenerationBlockInferenceModel(GenerationMixin):
             temperature,
             model_kwargs,
         ):
+            # print type
+            print(type(outputs), type(top_k), type(top_p), type(penalty_score), type(frequency_score), type(presence_score), type(temperature))
+            for (key, value) in model_kwargs.items():
+                print(key, type(value))
+            print(type(self.config.tensor_parallel_degree), type(self.config.tensor_parallel_rank))
+            # origin code
             step_idx = model_kwargs["step_idx"]
             logits = paddle.cast(outputs, paddle.float32)
 
@@ -771,16 +923,41 @@ class GenerationBlockInferenceModel(GenerationMixin):
         # encoder
         outputs = _forward_(**model_kwargs)  # [bs, 1, dim_embed]
         # first decoder
-        next_tokens = _post_process_(
-            outputs,
-            top_k,
-            top_p,
-            penalty_score,
-            frequency_score,
-            presence_score,
-            temperature,
-            model_kwargs,
-        )
+        if self.cuda_graph_runner.graph_is_none():
+            self.cuda_graph_runner.capture(
+                outputs, 
+                top_k=top_k,
+                top_p=top_p,
+                penalty_score=penalty_score,
+                frequency_score=frequency_score,
+                presence_score=presence_score,
+                temperature=temperature,
+                tensor_parallel_degree=self.config.tensor_parallel_degree,
+                tensor_parallel_rank=self.config.tensor_parallel_rank,
+                eos_token_id=eos_token_id,
+                **model_kwargs)
+        next_tokens = self.cuda_graph_runner(
+            outputs, 
+            top_k=top_k,
+            top_p=top_p,
+            penalty_score=penalty_score,
+            frequency_score=frequency_score,
+            presence_score=presence_score,
+            temperature=temperature,
+            tensor_parallel_degree=self.config.tensor_parallel_degree,
+            tensor_parallel_rank=self.config.tensor_parallel_rank,
+            eos_token_id=eos_token_id,
+            **model_kwargs)
+        # next_tokens = _post_process_(
+        #     outputs,
+        #     top_k,
+        #     top_p,
+        #     penalty_score,
+        #     frequency_score,
+        #     presence_score,
+        #     temperature,
+        #     model_kwargs,
+        # )
 
         return next_tokens
 
