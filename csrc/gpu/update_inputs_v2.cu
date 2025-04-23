@@ -110,7 +110,7 @@ __global__ void update_inputs_kernel_v2(
 
 void UpdateInputesV2(const paddle::Tensor& stop_flags,
                const paddle::Tensor& step_idx,
-               const paddle::Tensor& not_need_stop, // cpu
+               paddle::Tensor& not_need_stop, // cpu
                const paddle::Tensor& seq_lens_this_time,
                const paddle::Tensor& seq_lens_encoder,
                const paddle::Tensor& seq_lens_decoder,
@@ -126,6 +126,7 @@ void UpdateInputesV2(const paddle::Tensor& stop_flags,
   const int input_ids_stride = input_ids.shape()[1];
   const int end_length = end_ids.shape()[0];
 
+  std::cout << "before: not_need_stop data_prt:" << not_need_stop.data() << const_cast<bool*>(not_need_stop.data<bool>())[0];
   auto not_need_stop_gpu = not_need_stop.copy_to(stop_flags.place(), false);
 
   update_inputs_kernel_v2<1024><<<1, 1024, 0, input_ids.stream()>>>(
@@ -147,10 +148,17 @@ void UpdateInputesV2(const paddle::Tensor& stop_flags,
     input_ids_stride,
     end_length
   );
-
+  // func 0
   auto not_need_stop_cpu = not_need_stop_gpu.copy_to(not_need_stop.place(), false);
   bool *not_need_stop_data = const_cast<bool*>(not_need_stop.data<bool>());
   not_need_stop_data[0] = not_need_stop_cpu.data<bool>()[0];
+  std::cout << "after func1: not_need_stop data_prt:" << not_need_stop.data() <<  " data: " << const_cast<bool*>(not_need_stop.data<bool>())[0];
+
+  // func 1
+  not_need_stop.copy_(not_need_stop_gpu, not_need_stop.place(), false);
+  std::cout << "after func2: not_need_stop data_prt:" << not_need_stop.data() <<  " data: " << const_cast<bool*>(not_need_stop.data<bool>())[0];
+
+  // func 2
 }
 
 PD_BUILD_OP(update_inputs_v2)

@@ -201,7 +201,7 @@ void SetPreidsTokenPenaltyMultiScores(const paddle::Tensor& pre_ids,
 
 void UpdateInputesV2(const paddle::Tensor& stop_flags,
                const paddle::Tensor& step_idx,
-               const paddle::Tensor& not_need_stop, // cpu
+               paddle::Tensor& not_need_stop, // cpu
                const paddle::Tensor& seq_lens_this_time,
                const paddle::Tensor& seq_lens_encoder,
                const paddle::Tensor& seq_lens_decoder,

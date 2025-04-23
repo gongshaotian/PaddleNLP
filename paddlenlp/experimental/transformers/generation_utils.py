@@ -141,6 +141,7 @@ class CudaGraphRunner(nn.Layer):
             else:
                 self.input_buffers[name] = value
             # print(f"parameter name: {name}, value: {value}, buffer value: {self.input_buffers[name]}")
+        self.output_buffers["origional_stop_tensor"] = kwargs["not_need_stop"]
 
     def capture(self, graph_inputs, **kwargs) -> None:
         assert self._graph is None
@@ -176,6 +177,11 @@ class CudaGraphRunner(nn.Layer):
             self.prepare_input_buffer(**kwargs)
 
             self._graph.replay()
+
+            # process output buffer
+            # self.output_buffers["origional_stop_tensor"].copy_(self.input_buffers["not_need_stop"], False)
+            print("kwargs['not_need_stop']", kwargs['not_need_stop'])
+            print("input_buffers['not_need_stop]", self.input_buffers["not_need_stop"])
             return self.output_buffers["output_ids"]
         except :
             pass 

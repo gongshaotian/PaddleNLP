@@ -191,7 +191,7 @@ class PredictorArgument:
         metadata={"help": "Quantization type of moe. Supported values: weight_only_int4, weight_only_int8"},
     )
     output_via_mq: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Controls whether the message queue is enabled for output"},
     )
     dynamic_insert: bool = field(default=False, metadata={"help": "whether use dynamic insert"})
