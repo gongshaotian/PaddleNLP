@@ -929,7 +929,7 @@ class BlockInferencePredictorMixin(BasePredictor):
         )
         self.model_inputs["bad_tokens"] = paddle.to_tensor([-1], dtype="int64")
         self.model_inputs["is_block_step"] = paddle.full(shape=[config.batch_size], fill_value=False, dtype="bool")
-        self.model_inputs["msg_queue_id"] = paddle.full(shape=[1], fill_value=self.msg_queue_id, dtype="int32").cpu()
+        self.model_inputs["msg_queue_id"] = paddle.full(shape=[1], fill_value=self.msg_queue_id, dtype="int32").pin_memory()
 
         # bloom model needs src_mask and tgt_mask!
         if "bloom" in self.architectures:
@@ -1045,7 +1045,7 @@ class BlockInferencePredictorMixin(BasePredictor):
             shape=[self.config.batch_size, 1], fill_value=0, dtype="int32"
         )
         self.model_inputs["step_idx"] = paddle.full(shape=[self.config.batch_size, 1], fill_value=0, dtype="int64")
-        self.model_inputs["not_need_stop"] = paddle.full(shape=[1], fill_value=True, dtype="bool").cpu()  # cpu
+        self.model_inputs["not_need_stop"] = paddle.full(shape=[1], fill_value=True, dtype="bool").pin_memory()  # pinned memory
         self.model_inputs["stop_flags"] = paddle.full(
             shape=[self.config.batch_size, 1], fill_value=False, dtype="bool"
         )
